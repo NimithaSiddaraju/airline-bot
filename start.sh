@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -e
-# Render will provide $PORT; bind to 0.0.0.0 so it’s public.
+# Bind to the port Render provides and to all interfaces.
 uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
