@@ -27,42 +27,17 @@ def normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
 def detect_iata_tokens(user_msg: str) -> List[str]:
-    """Return 3-letter IATA codes typed by user"""
     tokens = re.findall(r"\b[a-zA-Z]{3}\b", user_msg)
     hits = [t.upper() if t.isupper() else None for t in tokens]
     hits = [h for h in hits if h and h in iata_set]
+
     if not hits and len(user_msg.strip()) == 3:
         t = user_msg.strip().upper()
         if t in iata_set:
             hits = [t]
     return hits
 
-# ============================================================
-# AviationStack API wrapper
-# ============================================================
-AVIATIONSTACK_KEY = "5c405fe0aa56286d8e7698ff945dff76"
-
-def query_aviationstack(dep: str = None, arr: str = None):
-    url = "http://api.aviationstack.com/v1/flights"
-    params = {"access_key": AVIATIONSTACK_KEY}
-    if dep:
-        params["dep_iata"] = dep
-    if arr:
-        params["arr_iata"] = arr
-    try:
-        resp = httpx.get(url, params=params, timeout=30.0)
-        if resp.status_code != 200:
-            return None, f"AviationStack status {resp.status_code}"
-        data = resp.json()
-        if "error" in data:
-            return None, f"AviationStack error {data['error']}"
-        return data.get("data", []), None
-    except Exception as e:
-        return None, f"AviationStack error: {e}"
-
-# ============================================================
-# FAQs
-# ============================================================
+# --- FAQs ---
 def get_tsa_liquids_summary():
     url = "https://www.tsa.gov/travel/security-screening/whatcanibring/items/travel-size-toiletries"
     summary = ("TSA liquids rule (3-1-1): containers ≤ 3.4 oz / 100 mL; "
@@ -77,7 +52,7 @@ def get_faa_powerbank_summary():
                "protect terminals from short circuit.")
     return summary, url
 
-# Airline baggage links
+# --- Airline baggage links ---
 AIRLINE_LINKS = {
     "american": "https://www.aa.com/i18n/travel-info/baggage/baggage.jsp",
     "aa":       "https://www.aa.com/i18n/travel-info/baggage/baggage.jsp",
@@ -91,6 +66,7 @@ AIRLINE_LINKS = {
     "as":       "https://www.alaskaair.com/travel-info/baggage/overview",
     "jetblue":  "https://www.jetblue.com/help/baggage",
     "b6":       "https://www.jetblue.com/help/baggage",
+    # Intl
     "air canada": "https://www.aircanada.com/ca/en/aco/home/plan/baggage.html",
     "ac":         "https://www.aircanada.com/ca/en/aco/home/plan/baggage.html",
     "british airways": "https://www.britishairways.com/en-us/information/baggage-essentials",
@@ -98,12 +74,15 @@ AIRLINE_LINKS = {
     "lufthansa": "https://www.lufthansa.com/us/en/baggage-overview",
     "lh":        "https://www.lufthansa.com/us/en/baggage-overview",
     "emirates":  "https://www.emirates.com/us/english/before-you-fly/baggage/",
+    "emirates airlines": "https://www.emirates.com/us/english/before-you-fly/baggage/",
     "ek":        "https://www.emirates.com/us/english/before-you-fly/baggage/",
     "qatar":     "https://www.qatarairways.com/en-us/baggage/allowance.html",
+    "qatar airways": "https://www.qatarairways.com/en-us/baggage/allowance.html",
     "qr":        "https://www.qatarairways.com/en-us/baggage/allowance.html",
     "singapore": "https://www.singaporeair.com/en_UK/us/travel-info/baggage/",
     "sq":        "https://www.singaporeair.com/en_UK/us/travel-info/baggage/",
 }
+
 ALIAS_TO_NAME = {
     "aa":"American Airlines","dl":"Delta Air Lines","ua":"United Airlines",
     "wn":"Southwest Airlines","as":"Alaska Airlines","b6":"JetBlue",
@@ -111,39 +90,87 @@ ALIAS_TO_NAME = {
     "ek":"Emirates","qr":"Qatar Airways","sq":"Singapore Airlines"
 }
 
+BAGGAGE_KEYWORDS = [
+    "baggage","bags","luggage","checked bag","checked bags","carry-on",
+    "carry on","carryon","baggage allowance","bag fee","bag fees","allowance",
+    "how many bags","how much luggage","how much baggage"
+]
+
 def get_airline_baggage_link(text: str):
     t = normalize(text)
-    for key in ["air canada","british airways"]:
+
+    # Multi-word checks first
+    for key in ["air canada", "british airways", "emirates airlines", "qatar airways"]:
         if key in t:
             return key.title(), AIRLINE_LINKS[key]
+
+    # Single-word / aliases
     for key, url in AIRLINE_LINKS.items():
-        if key in ["air canada","british airways"]:
-            continue
-        if key in t:
+        if re.search(rf"\b{re.escape(key)}\b", t):
             return ALIAS_TO_NAME.get(key, key.title()), url
+
     return None, None
 
+# --- Power bank calculator ---
+def powerbank_wh_from_text(text: str) -> Optional[Tuple[float, float]]:
+    t = text.lower().replace(",", " ")
+    m_wh = re.search(r"(\d+(\.\d+)?)\s*wh\b", t)
+    if m_wh:
+        return float(m_wh.group(1)), None
+    m_mah = re.search(r"(\d+(\.\d+)?)\s*mah\b", t)
+    if m_mah:
+        mah = float(m_mah.group(1))
+        m_v = re.search(r"(\d+(\.\d+)?)\s*v\b", t)
+        v = float(m_v) if m_v else 3.7
+        wh = (mah/1000.0) * v
+        return wh, v
+    return None
+
+def classify_wh(wh: float):
+    if wh <= 100:
+        return "Allowed in carry-on without airline approval (no checked baggage)."
+    elif wh <= 160:
+        return "Carry-on allowed with airline approval (no checked baggage)."
+    else:
+        return "Not allowed for passenger aircraft (exceeds 160 Wh)."
+
 # ============================================================
-# Intent detection
+# AviationStack Query
 # ============================================================
-BAGGAGE_KEYWORDS = ["baggage","bags","luggage","carry-on","carry on","carryon"]
+def query_aviationstack(iata_code: str, direction: str = "from"):
+    url = "http://api.aviationstack.com/v1/flights"
+    params = {
+        "access_key": "5c405fe0aa56286d8e7698ff945dff76",  # your key
+        "limit": 5,
+    }
+    if direction == "from":
+        params["dep_iata"] = iata_code
+    else:
+        params["arr_iata"] = iata_code
 
-def is_liquids_intent(user_l: str) -> bool:
-    return any(k in user_l for k in ["liquid","toiletries","3-1-1","100ml"])
+    try:
+        resp = httpx.get(url, params=params, timeout=30.0)
+        if resp.status_code != 200:
+            return None, f"AviationStack status {resp.status_code}: {resp.text}"
 
-def is_powerbank_intent(user_l: str) -> bool:
-    return any(k in user_l for k in ["power bank","battery","lithium","mah","wh"])
+        data = resp.json().get("data", [])
+        flights = []
+        for f in data:
+            airline = f.get("airline", {}).get("name", "Unknown")
+            flight_no = f.get("flight", {}).get("iata", "N/A")
+            dep = f.get("departure", {}).get("iata", "???")
+            arr = f.get("arrival", {}).get("iata", "???")
+            status = f.get("flight_status", "unknown")
+            flights.append(f"{airline} {flight_no} {dep}→{arr} — {status}")
+        return flights, None
 
-def is_baggage_intent(user_l: str) -> bool:
-    return any(k in user_l for k in BAGGAGE_KEYWORDS)
-
-def is_live_flights_intent(user_l: str) -> bool:
-    return any(k in user_l for k in ["flight","flights","planes","from","to"])
+    except Exception as e:
+        return None, f"AviationStack error: {e}"
 
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="Airline Chatbot", version="2.0.0")
+app = FastAPI(title="Airline Chatbot", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False
@@ -152,71 +179,73 @@ app.add_middleware(
 class Query(BaseModel):
     message: str
 
-@app.get("/")
-def root():
-    return {"msg": "Airline Chatbot API. Use POST /chat."}
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
 @app.post("/chat")
 async def chat(q: Query):
     user_msg = q.message.strip()
     user_l   = normalize(user_msg)
 
-    # FAQs
-    if is_liquids_intent(user_l):
+    # 1) FAQs
+    if any(k in user_l for k in ["liquid","toiletries","3-1-1","3 1 1","100ml","100 ml"]):
         info, src = get_tsa_liquids_summary()
         return {"answer": info, "source": src}
 
-    if is_powerbank_intent(user_l):
+    if any(k in user_l for k in ["power bank","powerbank","battery","lithium","mah","wh"]):
+        calc = powerbank_wh_from_text(user_l)
+        if calc:
+            wh, v = calc
+            verdict = classify_wh(wh)
+            v_txt = "" if v is None else f" using {v} V,"
+            return {"answer": f"Estimated capacity ≈ {wh:.1f} Wh{v_txt} which falls under: {verdict}",
+                    "source": "https://www.faa.gov/hazmat/packsafe/lithium-batteries"}
         info, src = get_faa_powerbank_summary()
         return {"answer": info, "source": src}
 
-    if is_baggage_intent(user_l):
+    if any(k in user_l for k in BAGGAGE_KEYWORDS):
         name, link = get_airline_baggage_link(user_l)
         if link:
             return {"answer": f"Here’s the official baggage policy for {name}:", "source": link}
-        return {"answer": "Tell me the airline (e.g., 'United baggage', 'AA baggage allowance')."}
+        return {"answer": "Tell me the airline (e.g., 'United baggage', 'AA baggage allowance', 'Emirates baggage')."}
 
-    # Live flights
-    if is_live_flights_intent(user_l):
+    # 2) Flights
+    if "flight" in user_l or "flights" in user_l:
         codes = detect_iata_tokens(user_msg)
         if codes:
-            dep_code = codes[0]
-            flights, err = query_aviationstack(dep=dep_code)
-            if err:
-                return {"answer": err}
-            if flights:
-                examples = []
-                for f in flights[:5]:
-                    airline = f["airline"]["name"] if f.get("airline") else "Unknown"
-                    flight_no = f["flight"]["iata"] if f.get("flight") else "N/A"
-                    dep = f["departure"]["iata"] or "?"
-                    arr = f["arrival"]["iata"] or "?"
-                    status = f.get("flight_status", "unknown")
-                    examples.append(f"{airline} {flight_no} {dep}→{arr} — {status}")
-                return {"answer": f"Found {len(flights)} flights from {dep_code}. Examples: {', '.join(examples)}."}
+            code = codes[0]
+            if "to" in user_l:
+                flights, err = query_aviationstack(code, "to")
+                direction = f"to {code}"
             else:
-                return {"answer": f"No flights found from {dep_code} right now."}
+                flights, err = query_aviationstack(code, "from")
+                direction = f"from {code}"
+            if err:
+                return {"answer": f"Could not fetch flight data ({err})."}
+            if flights:
+                return {"answer": f"Found {len(flights)} flights {direction}. Examples:\n" + "\n".join(flights)}
+            return {"answer": f"No flights found {direction} right now."}
 
-    # Airport info
-    iata_hits = detect_iata_tokens(user_msg)
-    for code in iata_hits:
+    # 3) Airport lookup
+    codes = detect_iata_tokens(user_msg)
+    for code in codes:
         r = airports.loc[airports["IATA"] == code, ["name","city","country","IATA","ICAO"]]
         if not r.empty:
             row = r.iloc[0]
             return {"answer": f"{row['IATA']} = {row['name']} in {row['city']}, {row['country']} (ICAO {row['ICAO']})."}
 
+    by_city = airports.loc[airports["city_l"].str.contains(user_l, na=False), ["name","city","country","IATA","ICAO"]]
+    if not by_city.empty:
+        row = by_city.iloc[0]
+        return {"answer": f"Airport in {row['city']}: {row['name']} (IATA {row['IATA']}, ICAO {row['ICAO']})."}
+
+    by_name = airports.loc[airports["name_l"].str.contains(user_l, na=False), ["name","city","country","IATA","ICAO"]]
+    if not by_name.empty:
+        row = by_name.iloc[0]
+        return {"answer": f"{row['name']} is in {row['city']}, {row['country']} (IATA {row['IATA']}, ICAO {row['ICAO']})."}
+
     # Fallback
     return {
-        "answer": (
-            "I can help with:\n"
-            "• Live flights by IATA code (e.g., 'Flights from LAX')\n"
-            "• Airline baggage links (e.g., 'United baggage')\n"
-            "• TSA liquids rule\n"
-            "• FAA power bank rules\n"
-            "• Airport info by code or city"
-        )
+        "answer": ("I can help with:\n"
+                   "• Airline baggage links (e.g., 'United baggage', 'AA carry on size', 'Emirates baggage')\n"
+                   "• TSA liquids & FAA power banks (e.g., 'what's the liquids rule', 'is 20000 mAh allowed')\n"
+                   "• Live flights by IATA code (e.g., 'Flights from LAX', 'Flights to DFW')\n"
+                   "• Airport info by code/name/city (e.g., 'DFW', 'airport in Tokyo').")
     }
