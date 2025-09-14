@@ -4,20 +4,41 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import httpx
-import math, re
+import re
 from typing import Tuple, Optional, List
 
 # ============================================================
-# Remote reference data (no local files)
+# Remote reference data
 # ============================================================
 AIRPORTS_URL = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat"
 COLS = ["id","name","city","country","IATA","ICAO","lat","lon","alt_ft","tz_offset","dst","tzdb","type","source"]
 airports = pd.read_csv(AIRPORTS_URL, header=None, names=COLS)
 
-# Lightweight preprocess for matching
 airports["city_l"] = airports["city"].fillna("").str.lower()
 airports["name_l"] = airports["name"].fillna("").str.lower()
 iata_set = set(airports["IATA"].dropna().astype(str))
+
+# ============================================================
+# AviationStack API (your API key)
+# ============================================================
+AVIATIONSTACK_KEY = "5c405fe0aa56286d8e7698ff945dff76"
+
+def query_aviationstack(dep_iata: str):
+    """Fetch live flights departing from a given IATA airport code"""
+    url = "http://api.aviationstack.com/v1/flights"
+    params = {
+        "access_key": AVIATIONSTACK_KEY,
+        "dep_iata": dep_iata,
+        "limit": 5
+    }
+    try:
+        resp = httpx.get(url, params=params, timeout=15.0)
+        if resp.status_code != 200:
+            return None, f"AviationStack status {resp.status_code}"
+        data = resp.json()
+        return data.get("data", []), None
+    except Exception as e:
+        return None, f"AviationStack error: {e}"
 
 # ============================================================
 # Helpers
@@ -35,50 +56,6 @@ def detect_iata_tokens(user_msg: str) -> List[str]:
         if t in iata_set:
             hits = [t]
     return hits
-
-def find_location_from_message(msg_lower: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    m = re.search(r"(near|around|over|in|at)\s+([a-zA-Z .'\-]+)", msg_lower)
-    candidate = (m.group(2).strip() if m else msg_lower).lower()
-
-    city_hits = airports.loc[
-        airports["city_l"].str.contains(candidate, na=False),
-        ["city","name","lat","lon","country","IATA"]
-    ].dropna(subset=["lat","lon"])
-    if not city_hits.empty:
-        lat = float(city_hits["lat"].astype(float).mean())
-        lon = float(city_hits["lon"].astype(float).mean())
-        label = f"{city_hits.iloc[0]['city']} ({city_hits.iloc[0]['country']})"
-        return lat, lon, label
-
-    name_hits = airports.loc[
-        airports["name_l"].str.contains(candidate, na=False),
-        ["city","name","lat","lon","country","IATA"]
-    ].dropna(subset=["lat","lon"])
-    if not name_hits.empty:
-        lat = float(name_hits["lat"].astype(float).mean())
-        lon = float(name_hits["lon"].astype(float).mean())
-        label = f"{name_hits.iloc[0]['name']} ({name_hits.iloc[0]['city']})"
-        return lat, lon, label
-
-    return None, None, None
-
-def bbox_from_center(lat: float, lon: float, deg_pad: float = 1.5):
-    lamin = lat - deg_pad
-    lamax = lat + deg_pad
-    lon_pad = deg_pad / max(math.cos(math.radians(abs(lat))), 0.2)
-    lomin = lon - lon_pad
-    lomax = lon + lon_pad
-    return {"lamin": round(lamin, 4), "lomin": round(lomin, 4), "lamax": round(lamax, 4), "lomax": round(lomax, 4)}
-
-def query_opensky(params: dict):
-    try:
-        resp = httpx.get("https://opensky-network.org/api/states/all", params=params, timeout=30.0)
-        if resp.status_code != 200:
-            return None, f"OpenSky status {resp.status_code}"
-        data = resp.json()
-        return data.get("states") or [], None
-    except Exception as e:
-        return None, f"OpenSky error: {e}"
 
 # --- FAQs ---
 def get_tsa_liquids_summary():
@@ -141,48 +118,13 @@ def get_airline_baggage_link(text: str):
             return ALIAS_TO_NAME.get(key, key.title()), url
     return None, None
 
-# --- Power bank calculator ---
-def powerbank_wh_from_text(text: str) -> Optional[Tuple[float, float]]:
-    t = text.lower().replace(",", " ")
-    m_wh = re.search(r"(\d+(\.\d+)?)\s*wh\b", t)
-    if m_wh:
-        return float(m_wh.group(1)), None
-    m_mah = re.search(r"(\d+(\.\d+)?)\s*mah\b", t)
-    if m_mah:
-        mah = float(m_mah.group(1))
-        m_v = re.search(r"(\d+(\.\d+)?)\s*v\b", t)
-        v = float(m_v.group(1)) if m_v else 3.7
-        wh = (mah/1000.0) * v
-        return wh, v
-    return None
-
-def classify_wh(wh: float):
-    if wh <= 100:
-        return "Allowed in carry-on without airline approval (no checked baggage)."
-    elif wh <= 160:
-        return "Carry-on allowed with airline approval (no checked baggage)."
-    else:
-        return "Not allowed for passenger aircraft (exceeds 160 Wh)."
-
-def is_liquids_intent(user_l: str) -> bool:
-    return any(k in user_l for k in ["liquid","toiletries","3-1-1","3 1 1","100ml","100 ml"])
-
-def is_powerbank_intent(user_l: str) -> bool:
-    return any(k in user_l for k in ["power bank","powerbank","battery","lithium","mah","wh"])
-
-def is_baggage_intent(user_l: str) -> bool:
-    return any(k in user_l for k in ["baggage","bags","luggage","checked bag","carry-on","carry on","baggage allowance","bag fee"])
-
-def is_live_flights_intent(user_l: str) -> bool:
-    return any(k in user_l for k in ["flight","flights","aircraft","planes","plane","traffic","over","near","around","in","at"])
-
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="Airline Chatbot", version="1.1.0")
+app = FastAPI(title="Airline Chatbot", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://nimithasiddaraju.github.io"],  # ✅ restrict to your frontend
+    allow_origins=["https://nimithasiddaraju.github.io"],  # ✅ your frontend
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -192,91 +134,51 @@ class Query(BaseModel):
 
 @app.get("/")
 def root():
-    return {"msg": "Airline Chatbot API. Use POST /chat or open /docs for Swagger UI."}
-
-@app.get("/health")
-def health():
-    return {"ok": True}
+    return {"msg": "Airline Chatbot API (AviationStack). Use POST /chat or open /docs."}
 
 @app.post("/chat")
 async def chat(q: Query):
     user_msg = q.message.strip()
     user_l   = normalize(user_msg)
 
-    if is_liquids_intent(user_l):
+    # FAQ intents
+    if any(k in user_l for k in ["liquid","toiletries","3-1-1","100ml","100 ml"]):
         info, src = get_tsa_liquids_summary()
         return {"answer": info, "source": src}
 
-    if is_powerbank_intent(user_l):
-        calc = powerbank_wh_from_text(user_l)
-        if calc:
-            wh, v = calc
-            verdict = classify_wh(wh)
-            v_txt = "" if v is None else f" using {v} V,"
-            return {
-                "answer": f"Estimated capacity ≈ {wh:.1f} Wh{v_txt} which falls under: {verdict}",
-                "source": "https://www.faa.gov/hazmat/packsafe/lithium-batteries"
-            }
+    if any(k in user_l for k in ["power bank","powerbank","battery","lithium","mah","wh"]):
         info, src = get_faa_powerbank_summary()
         return {"answer": info, "source": src}
 
-    if is_baggage_intent(user_l):
+    if any(k in user_l for k in ["baggage","bags","luggage","checked bag","carry-on","carry on"]):
         name, link = get_airline_baggage_link(user_l)
         if link:
             return {"answer": f"Here’s the official baggage policy for {name}:", "source": link}
-        return {"answer": "Tell me the airline (e.g., 'baggage for United', 'AA baggage allowance', 'Delta carry-on size') and I’ll fetch the official policy link."}
+        return {"answer": "Tell me the airline (e.g., 'United baggage', 'AA baggage allowance')."}
 
-    if is_live_flights_intent(user_l):
+    # Live flights intent
+    if any(k in user_l for k in ["flight","flights","aircraft","planes","plane","traffic"]):
         codes = detect_iata_tokens(user_msg)
         if codes:
-            code = codes[0]
-            r = airports.loc[airports["IATA"] == code, ["name","city","country","lat","lon","IATA"]].dropna(subset=["lat","lon"])
-            if not r.empty:
-                a = r.iloc[0]
-                lat, lon = float(a["lat"]), float(a["lon"])
-                label = f"{a['IATA']} - {a['name']} ({a['city']})"
-            else:
-                lat = lon = None
-                label = None
-        else:
-            lat, lon, label = find_location_from_message(user_l)
-
-        if lat is not None and lon is not None:
-            params = bbox_from_center(lat, lon, deg_pad=1.5)
-            states, err = query_opensky(params)
+            dep_code = codes[0]
+            flights, err = query_aviationstack(dep_code)
             if err:
                 return {"answer": f"Could not fetch live data ({err}). Try again shortly."}
-            if states:
+            if flights:
                 examples = []
-                for s in states[:5]:
-                    callsign = (s[1] or "").strip() or "unknown"
-                    alt_m = s[13] if isinstance(s[13], (int, float)) else 0
-                    examples.append(f"{callsign} at {round(alt_m)} m")
-                return {"answer": f"Found {len(states)} aircraft near {label}. Examples: {', '.join(examples)}."}
+                for f in flights[:5]:
+                    flight = f.get("flight", {})
+                    dep = f.get("departure", {})
+                    arr = f.get("arrival", {})
+                    examples.append(f"{flight.get('iata', '??')} {dep.get('iata', '?')}→{arr.get('iata', '?')}")
+                return {"answer": f"Found {len(flights)} flights from {dep_code}. Examples: {', '.join(examples)}."}
             else:
-                return {"answer": f"No live aircraft found near {label} right now."}
-
-    iata_hits = detect_iata_tokens(user_msg)
-    for code in iata_hits:
-        r = airports.loc[airports["IATA"] == code, ["name","city","country","IATA","ICAO"]]
-        if not r.empty:
-            row = r.iloc[0]
-            return {"answer": f"{row['IATA']} = {row['name']} in {row['city']}, {row['country']} (ICAO {row['ICAO']})."}
-
-    by_city = airports.loc[airports["city_l"].str.contains(user_l, na=False), ["name","city","country","IATA","ICAO"]]
-    if not by_city.empty:
-        row = by_city.iloc[0]
-        return {"answer": f"Airport in {row['city']}: {row['name']} (IATA {row['IATA']}, ICAO {row['ICAO']})."}
-
-    by_name = airports.loc[airports["name_l"].str.contains(user_l, na=False), ["name","city","country","IATA","ICAO"]]
-    if not by_name.empty:
-        row = by_name.iloc[0]
-        return {"answer": f"{row['name']} is in {row['city']}, {row['country']} (IATA {row['IATA']}, ICAO {row['ICAO']})."}
+                return {"answer": f"No live flights found for {dep_code} right now."}
 
     return {
         "answer": ("I can help with:\n"
-                   "• Airline baggage links (e.g., 'United baggage', 'AA carry on size')\n"
-                   "• TSA liquids & FAA power banks (e.g., 'what's the liquids rule', 'is 20000 mAh allowed')\n"
-                   "• Live aircraft near a place (e.g., 'planes over LAX', 'flights near New York')\n"
-                   "• Airport info by code/name/city (e.g., 'DFW', 'airport in Tokyo').")
+                   "• Airline baggage links\n"
+                   "• TSA liquids & FAA power banks\n"
+                   "• Live flights by IATA code (e.g., 'Flights from LAX')\n"
+                   "• Airport info by code/name/city")
     }
