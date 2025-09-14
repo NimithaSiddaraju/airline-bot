@@ -27,13 +27,10 @@ def normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
 def detect_iata_tokens(user_msg: str) -> List[str]:
-    """
-    Return 3-letter IATA codes that the user actually typed as codes.
-    Accept whole-word 3-letter tokens.
-    """
+    """Return 3-letter IATA codes typed by user"""
     tokens = re.findall(r"\b[a-zA-Z]{3}\b", user_msg)
-    hits = [t.upper() for t in tokens if t.upper() in iata_set]
-
+    hits = [t.upper() if t.isupper() else None for t in tokens]
+    hits = [h for h in hits if h and h in iata_set]
     if not hits and len(user_msg.strip()) == 3:
         t = user_msg.strip().upper()
         if t in iata_set:
@@ -41,7 +38,30 @@ def detect_iata_tokens(user_msg: str) -> List[str]:
     return hits
 
 # ============================================================
-# FAQs (sync summaries; link to official sources)
+# AviationStack API wrapper
+# ============================================================
+AVIATIONSTACK_KEY = "5c405fe0aa56286d8e7698ff945dff76"
+
+def query_aviationstack(dep: str = None, arr: str = None):
+    url = "http://api.aviationstack.com/v1/flights"
+    params = {"access_key": AVIATIONSTACK_KEY}
+    if dep:
+        params["dep_iata"] = dep
+    if arr:
+        params["arr_iata"] = arr
+    try:
+        resp = httpx.get(url, params=params, timeout=30.0)
+        if resp.status_code != 200:
+            return None, f"AviationStack status {resp.status_code}"
+        data = resp.json()
+        if "error" in data:
+            return None, f"AviationStack error {data['error']}"
+        return data.get("data", []), None
+    except Exception as e:
+        return None, f"AviationStack error: {e}"
+
+# ============================================================
+# FAQs
 # ============================================================
 def get_tsa_liquids_summary():
     url = "https://www.tsa.gov/travel/security-screening/whatcanibring/items/travel-size-toiletries"
@@ -57,9 +77,7 @@ def get_faa_powerbank_summary():
                "protect terminals from short circuit.")
     return summary, url
 
-# ============================================================
 # Airline baggage links
-# ============================================================
 AIRLINE_LINKS = {
     "american": "https://www.aa.com/i18n/travel-info/baggage/baggage.jsp",
     "aa":       "https://www.aa.com/i18n/travel-info/baggage/baggage.jsp",
@@ -95,42 +113,32 @@ ALIAS_TO_NAME = {
 
 def get_airline_baggage_link(text: str):
     t = normalize(text)
-    # Check multi-word airlines
     for key in ["air canada","british airways"]:
         if key in t:
             return key.title(), AIRLINE_LINKS[key]
-    # Check others loosely
     for key, url in AIRLINE_LINKS.items():
         if key in ["air canada","british airways"]:
             continue
-        if key in t:  # looser match
+        if key in t:
             return ALIAS_TO_NAME.get(key, key.title()), url
     return None, None
 
 # ============================================================
-# Power bank calculator
+# Intent detection
 # ============================================================
-def powerbank_wh_from_text(text: str) -> Optional[Tuple[float, float]]:
-    t = text.lower().replace(",", " ")
-    m_wh = re.search(r"(\d+(\.\d+)?)\s*wh\b", t)
-    if m_wh:
-        return float(m_wh.group(1)), None
-    m_mah = re.search(r"(\d+(\.\d+)?)\s*mah\b", t)
-    if m_mah:
-        mah = float(m_mah.group(1))
-        m_v = re.search(r"(\d+(\.\d+)?)\s*v\b", t)
-        v = float(m_v.group(1)) if m_v else 3.7
-        wh = (mah/1000.0) * v
-        return wh, v
-    return None
+BAGGAGE_KEYWORDS = ["baggage","bags","luggage","carry-on","carry on","carryon"]
 
-def classify_wh(wh: float):
-    if wh <= 100:
-        return "Allowed in carry-on without airline approval (no checked baggage)."
-    elif wh <= 160:
-        return "Carry-on allowed with airline approval (no checked baggage)."
-    else:
-        return "Not allowed for passenger aircraft (exceeds 160 Wh)."
+def is_liquids_intent(user_l: str) -> bool:
+    return any(k in user_l for k in ["liquid","toiletries","3-1-1","100ml"])
+
+def is_powerbank_intent(user_l: str) -> bool:
+    return any(k in user_l for k in ["power bank","battery","lithium","mah","wh"])
+
+def is_baggage_intent(user_l: str) -> bool:
+    return any(k in user_l for k in BAGGAGE_KEYWORDS)
+
+def is_live_flights_intent(user_l: str) -> bool:
+    return any(k in user_l for k in ["flight","flights","planes","from","to"])
 
 # ============================================================
 # FastAPI app
@@ -146,7 +154,7 @@ class Query(BaseModel):
 
 @app.get("/")
 def root():
-    return {"msg": "Airline Chatbot API. Use POST /chat or open /docs for Swagger UI."}
+    return {"msg": "Airline Chatbot API. Use POST /chat."}
 
 @app.get("/health")
 def health():
@@ -157,66 +165,43 @@ async def chat(q: Query):
     user_msg = q.message.strip()
     user_l   = normalize(user_msg)
 
-    # ---------- TSA Liquids ----------
-    if any(k in user_l for k in ["liquid","toiletries","3-1-1","3 1 1","100ml","100 ml"]):
+    # FAQs
+    if is_liquids_intent(user_l):
         info, src = get_tsa_liquids_summary()
         return {"answer": info, "source": src}
 
-    # ---------- Power banks ----------
-    if any(k in user_l for k in ["power bank","powerbank","battery","lithium","mah","wh"]):
-        calc = powerbank_wh_from_text(user_l)
-        if calc:
-            wh, v = calc
-            verdict = classify_wh(wh)
-            v_txt = "" if v is None else f" using {v} V,"
-            return {
-                "answer": f"Estimated capacity ≈ {wh:.1f} Wh{v_txt} which falls under: {verdict}",
-                "source": "https://www.faa.gov/hazmat/packsafe/lithium-batteries"
-            }
+    if is_powerbank_intent(user_l):
         info, src = get_faa_powerbank_summary()
         return {"answer": info, "source": src}
 
-    # ---------- Airline baggage ----------
-    if any(k in user_l for k in ["baggage","bags","luggage","checked bag","carry-on","carry on","carryon","bag fee","allowance"]):
+    if is_baggage_intent(user_l):
         name, link = get_airline_baggage_link(user_l)
         if link:
             return {"answer": f"Here’s the official baggage policy for {name}:", "source": link}
         return {"answer": "Tell me the airline (e.g., 'United baggage', 'AA baggage allowance')."}
 
-    # ---------- Live flights (AviationStack) ----------
-    if user_l.startswith("flights from") or user_l.startswith("flights to"):
-        direction = "departures" if "from" in user_l else "arrivals"
+    # Live flights
+    if is_live_flights_intent(user_l):
         codes = detect_iata_tokens(user_msg)
         if codes:
-            code = codes[0]
-            url = f"http://api.aviationstack.com/v1/{direction}"
-            try:
-                resp = httpx.get(url, params={
-                    "access_key": "5c405fe0aa56286d8e7698ff945dff76",  # your API key
-                    "airport_iata": code
-                }, timeout=20.0)
-                if resp.status_code == 200:
-                    data = resp.json().get("data", [])
-                    if data:
-                        examples = []
-                        for f in data[:5]:
-                            airline = f.get("airline", {}).get("name", "Unknown Airline")
-                            flight_no = f.get("flight", {}).get("iata", "N/A")
-                            dep = f.get("departure", {}).get("iata", "???")
-                            arr = f.get("arrival", {}).get("iata", "???")
-                            status = f.get("flight_status", "scheduled")
-                            examples.append(f"{flight_no} ({airline}) {dep}→{arr} — {status}")
-                        return {
-                            "answer": f"Found {len(data)} {direction} for {code}. Examples: " + ", ".join(examples)
-                        }
-                    else:
-                        return {"answer": f"No {direction} found for {code} at this time."}
-                else:
-                    return {"answer": f"AviationStack error {resp.status_code}: {resp.text}"}
-            except Exception as e:
-                return {"answer": f"AviationStack error: {str(e)}"}
+            dep_code = codes[0]
+            flights, err = query_aviationstack(dep=dep_code)
+            if err:
+                return {"answer": err}
+            if flights:
+                examples = []
+                for f in flights[:5]:
+                    airline = f["airline"]["name"] if f.get("airline") else "Unknown"
+                    flight_no = f["flight"]["iata"] if f.get("flight") else "N/A"
+                    dep = f["departure"]["iata"] or "?"
+                    arr = f["arrival"]["iata"] or "?"
+                    status = f.get("flight_status", "unknown")
+                    examples.append(f"{airline} {flight_no} {dep}→{arr} — {status}")
+                return {"answer": f"Found {len(flights)} flights from {dep_code}. Examples: {', '.join(examples)}."}
+            else:
+                return {"answer": f"No flights found from {dep_code} right now."}
 
-    # ---------- Airport lookup ----------
+    # Airport info
     iata_hits = detect_iata_tokens(user_msg)
     for code in iata_hits:
         r = airports.loc[airports["IATA"] == code, ["name","city","country","IATA","ICAO"]]
@@ -224,21 +209,14 @@ async def chat(q: Query):
             row = r.iloc[0]
             return {"answer": f"{row['IATA']} = {row['name']} in {row['city']}, {row['country']} (ICAO {row['ICAO']})."}
 
-    by_city = airports.loc[airports["city_l"].str.contains(user_l, na=False), ["name","city","country","IATA","ICAO"]]
-    if not by_city.empty:
-        row = by_city.iloc[0]
-        return {"answer": f"Airport in {row['city']}: {row['name']} (IATA {row['IATA']}, ICAO {row['ICAO']})."}
-
-    by_name = airports.loc[airports["name_l"].str.contains(user_l, na=False), ["name","city","country","IATA","ICAO"]]
-    if not by_name.empty:
-        row = by_name.iloc[0]
-        return {"answer": f"{row['name']} is in {row['city']}, {row['country']} (IATA {row['IATA']}, ICAO {row['ICAO']})."}
-
-    # ---------- Fallback ----------
+    # Fallback
     return {
-        "answer": ("I can help with:\n"
-                   "• Live flights (departures & arrivals by IATA code)\n"
-                   "• Airline baggage links\n"
-                   "• TSA liquids & FAA power banks\n"
-                   "• Airport info by code/name/city")
+        "answer": (
+            "I can help with:\n"
+            "• Live flights by IATA code (e.g., 'Flights from LAX')\n"
+            "• Airline baggage links (e.g., 'United baggage')\n"
+            "• TSA liquids rule\n"
+            "• FAA power bank rules\n"
+            "• Airport info by code or city"
+        )
     }
