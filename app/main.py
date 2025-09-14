@@ -15,6 +15,7 @@ airports["city_l"] = airports["city"].fillna("").str.lower()
 airports["name_l"] = airports["name"].fillna("").str.lower()
 iata_set = set(airports["IATA"].dropna().astype(str))
 
+# ---------- Helper functions ----------
 def find_location_from_message(msg_lower: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
     tokens = re.findall(r"[a-zA-Z]{3}", msg_lower.upper())
     for t in tokens:
@@ -46,6 +47,7 @@ def find_location_from_message(msg_lower: str) -> Tuple[Optional[float], Optiona
 
     return None, None, None
 
+
 def bbox_from_center(lat: float, lon: float, deg_pad: float = 1.5):
     lamin = lat - deg_pad
     lamax = lat + deg_pad
@@ -53,6 +55,7 @@ def bbox_from_center(lat: float, lon: float, deg_pad: float = 1.5):
     lomin = lon - lon_pad
     lomax = lon + lon_pad
     return {"lamin": round(lamin, 4), "lomin": round(lomin, 4), "lamax": round(lamax, 4), "lomax": round(lomax, 4)}
+
 
 def query_opensky(params: dict):
     try:
@@ -64,6 +67,7 @@ def query_opensky(params: dict):
     except Exception as e:
         return None, f"OpenSky error: {e}"
 
+
 def get_tsa_liquids_summary():
     url = "https://www.tsa.gov/travel/security-screening/whatcanibring/items/travel-size-toiletries"
     summary = ("TSA liquids rule (3-1-1): containers ≤ 3.4 oz / 100 mL; "
@@ -71,12 +75,14 @@ def get_tsa_liquids_summary():
                "larger volumes → checked bag.")
     return summary, url
 
+
 def get_faa_powerbank_summary():
     url = "https://www.faa.gov/hazmat/packsafe/lithium-batteries"
     summary = ("Power banks (lithium batteries): carry-on only. "
                "≤100 Wh allowed; 100–160 Wh requires airline approval; "
                "no checked baggage; protect terminals.")
     return summary, url
+
 
 def get_airline_baggage_link(text: str):
     t = text.lower()
@@ -122,6 +128,7 @@ def get_airline_baggage_link(text: str):
             return name_map.get(key, key.title()), url
     return None, None
 
+
 def powerbank_wh_from_text(text: str) -> Optional[Tuple[float, float]]:
     t = text.lower().replace(",", " ")
     m_wh = re.search(r"(\d+(\.\d+)?)\s*wh\b", t)
@@ -136,6 +143,7 @@ def powerbank_wh_from_text(text: str) -> Optional[Tuple[float, float]]:
         return wh, v
     return None
 
+
 def classify_wh(wh: float):
     if wh <= 100:
         return "Allowed in carry-on without airline approval (no checked baggage)."
@@ -144,28 +152,37 @@ def classify_wh(wh: float):
     else:
         return "Not allowed for passenger aircraft (exceeds 160 Wh)."
 
+
+# ---------- App ----------
 app = FastAPI(title="Airline Chatbot", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[""], allow_methods=[""], allow_headers=["*"], allow_credentials=False
+    allow_origins=["*"],  # or ["https://nimithasiddaraju.github.io"]
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
+
 
 class Query(BaseModel):
     message: str
+
 
 @app.get("/")
 def root():
     return {"msg": "Airline Chatbot API. Use POST /chat or open /docs for Swagger UI."}
 
+
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/chat")
 async def chat(q: Query):
     user_msg = q.message.strip()
     user_l   = user_msg.lower()
 
+    # --- IATA lookup
     for token in re.findall(r"[a-zA-Z]{3}", user_l.upper()):
         if token in iata_set:
             r = airports.loc[airports["IATA"] == token, ["name","city","country","IATA","ICAO"]]
@@ -173,18 +190,21 @@ async def chat(q: Query):
                 row = r.iloc[0]
                 return {"answer": f"{row['IATA']} = {row['name']} in {row['city']}, {row['country']} (ICAO {row['ICAO']})."}
 
+    # --- City
     by_city = airports.loc[airports["city_l"].str.contains(user_l, na=False),
                            ["name","city","country","IATA","ICAO"]]
     if not by_city.empty:
         row = by_city.iloc[0]
         return {"answer": f"Airport in {row['city']}: {row['name']} (IATA {row['IATA']}, ICAO {row['ICAO']})."}
 
+    # --- Name
     by_name = airports.loc[airports["name_l"].str.contains(user_l, na=False),
                            ["name","city","country","IATA","ICAO"]]
     if not by_name.empty:
         row = by_name.iloc[0]
         return {"answer": f"{row['name']} is in {row['city']}, {row['country']} (IATA {row['IATA']}, ICAO {row['ICAO']})."}
 
+    # --- Flights
     if any(k in user_l for k in ["flight", "flights", "aircraft", "planes", "plane", "over", "near", "around", "in"]):
         lat, lon, label = find_location_from_message(user_l)
         if lat is not None and lon is not None:
@@ -202,10 +222,12 @@ async def chat(q: Query):
             else:
                 return {"answer": f"No live aircraft found near {label} right now."}
 
+    # --- Liquids
     if any(k in user_l for k in ["liquid", "toiletries", "3-1-1", "3 1 1", "100ml", "100 ml"]):
         info, src = get_tsa_liquids_summary()
         return {"answer": info, "source": src}
 
+    # --- Power bank
     if any(k in user_l for k in ["power bank", "powerbank", "battery", "lithium", "mah", "wh"]):
         calc = powerbank_wh_from_text(user_l)
         if calc:
@@ -219,12 +241,14 @@ async def chat(q: Query):
         info, src = get_faa_powerbank_summary()
         return {"answer": info, "source": src}
 
+    # --- Baggage
     if any(k in user_l for k in ["baggage", "luggage", "checked bag", "carry-on", "carry on", "baggage allowance", "bag fee"]):
         name, link = get_airline_baggage_link(user_l)
         if link:
             return {"answer": f"Here’s the official baggage policy for {name}:", "source": link}
         return {"answer": "Tell me the airline (e.g., 'baggage for United', 'AA baggage allowance', 'Delta carry-on size') and I’ll fetch the official policy link."}
 
+    # --- Default
     return {
         "answer": ("I can help with airport codes/names, live aircraft near a place, liquids/battery rules, "
                    "and airline baggage links. Try: "
