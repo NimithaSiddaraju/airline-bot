@@ -5,7 +5,6 @@ from pydantic import BaseModel
 import pandas as pd
 import httpx
 import re
-import math
 from typing import Tuple, Optional, List
 
 # ============================================================
@@ -22,7 +21,6 @@ iata_set = set(airports["IATA"].dropna().astype(str))
 # ============================================================
 # Helpers
 # ============================================================
-
 def normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
@@ -37,7 +35,7 @@ def detect_iata_tokens(user_msg: str) -> List[str]:
     return hits
 
 # ============================================================
-# AviationStack API (replaces OpenSky)
+# AviationStack API
 # ============================================================
 AVIATIONSTACK_KEY = "5c405fe0aa56286d8e7698ff945dff76"
 AVIATIONSTACK_URL = "http://api.aviationstack.com/v1/flights"
@@ -59,21 +57,23 @@ def query_aviationstack(dep_code: Optional[str] = None, arr_code: Optional[str] 
         return None, f"AviationStack error: {e}"
 
 # ============================================================
-# FAQs (summaries & links)
+# FAQs
 # ============================================================
 def get_tsa_liquids_summary():
-    url = "https://www.tsa.gov/travel/security-screening/whatcanibring/items/travel-size-toiletries"
-    summary = ("TSA liquids rule (3-1-1): containers ≤ 3.4 oz / 100 mL; "
-               "all containers fit in one quart-size bag; one bag per passenger; "
-               "larger volumes → checked bag.")
-    return summary, url
+    return (
+        "TSA liquids rule (3-1-1): containers ≤ 3.4 oz / 100 mL; "
+        "all containers fit in one quart-size bag; one bag per passenger; "
+        "larger volumes → checked bag.",
+        "https://www.tsa.gov/travel/security-screening/whatcanibring/items/travel-size-toiletries"
+    )
 
 def get_faa_powerbank_summary():
-    url = "https://www.faa.gov/hazmat/packsafe/lithium-batteries"
-    summary = ("Power banks (lithium batteries): carry-on only. "
-               "≤100 Wh allowed without airline approval; 100–160 Wh requires approval; "
-               "no checked baggage.")
-    return summary, url
+    return (
+        "Power banks (lithium batteries): carry-on only. "
+        "≤100 Wh allowed without airline approval; 100–160 Wh requires approval; "
+        "no checked baggage.",
+        "https://www.faa.gov/hazmat/packsafe/lithium-batteries"
+    )
 
 AIRLINE_LINKS = {
     "american": "https://www.aa.com/i18n/travel-info/baggage/baggage.jsp",
@@ -93,7 +93,6 @@ ALIAS_TO_NAME = {
     "aa":"American Airlines","dl":"Delta Air Lines","ua":"United Airlines",
     "wn":"Southwest Airlines","as":"Alaska Airlines","b6":"JetBlue"
 }
-
 BAGGAGE_KEYWORDS = ["baggage","bags","luggage","checked bag","carry-on","carry on"]
 
 def get_airline_baggage_link(text: str):
@@ -106,7 +105,7 @@ def get_airline_baggage_link(text: str):
 # ============================================================
 # FastAPI app
 # ============================================================
-app = FastAPI(title="Airline Chatbot", version="2.0.0")
+app = FastAPI(title="Airline Chatbot", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], allow_credentials=False
@@ -143,31 +142,53 @@ async def chat(q: Query):
     codes = detect_iata_tokens(user_msg)
     if codes:
         code = codes[0]
+
+        # Arrivals
         if "to " in user_l:
             flights, err = query_aviationstack(arr_code=code)
-            if err:
-                return {"answer": f"Could not fetch live data ({err})."}
+            if err: return {"answer": f"Could not fetch live data ({err})."}
+
+            # sort by arrival time
+            flights = sorted(
+                flights,
+                key=lambda f: f.get("arrival", {}).get("estimated") or f.get("arrival", {}).get("scheduled") or "",
+                reverse=True
+            )
+
             if flights:
                 examples = []
                 for f in flights[:5]:
                     fl = f.get("flight", {})
                     dep = f.get("departure", {})
                     arr = f.get("arrival", {})
-                    examples.append(f"{fl.get('iata', '??')} {dep.get('iata','?')}→{arr.get('iata','?')}")
-                return {"answer": f"Found {len(flights)} flights to {code}. Examples: {', '.join(examples)}."}
+                    airline = f.get("airline", {}).get("name", "Unknown Airline")
+                    status = f.get("flight_status", "unknown")
+                    examples.append(f"{fl.get('iata','??')} ({airline}) {dep.get('iata','?')}→{arr.get('iata','?')} — {status}")
+                return {"answer": f"Found {len(flights)} flights arriving at {code}. Examples: {', '.join(examples)}."}
             return {"answer": f"No live flights arriving at {code} right now."}
+
+        # Departures
         else:
             flights, err = query_aviationstack(dep_code=code)
-            if err:
-                return {"answer": f"Could not fetch live data ({err})."}
+            if err: return {"answer": f"Could not fetch live data ({err})."}
+
+            # sort by departure time
+            flights = sorted(
+                flights,
+                key=lambda f: f.get("departure", {}).get("actual") or f.get("departure", {}).get("scheduled") or "",
+                reverse=True
+            )
+
             if flights:
                 examples = []
                 for f in flights[:5]:
                     fl = f.get("flight", {})
                     dep = f.get("departure", {})
                     arr = f.get("arrival", {})
-                    examples.append(f"{fl.get('iata', '??')} {dep.get('iata','?')}→{arr.get('iata','?')}")
-                return {"answer": f"Found {len(flights)} flights from {code}. Examples: {', '.join(examples)}."}
+                    airline = f.get("airline", {}).get("name", "Unknown Airline")
+                    status = f.get("flight_status", "unknown")
+                    examples.append(f"{fl.get('iata','??')} ({airline}) {dep.get('iata','?')}→{arr.get('iata','?')} — {status}")
+                return {"answer": f"Found {len(flights)} flights departing {code}. Examples: {', '.join(examples)}."}
             return {"answer": f"No live flights departing {code} right now."}
 
     # Airport lookup
